@@ -3,12 +3,44 @@
 #include <iomanip>
 #include <algorithm>
 #include <omp.h>
+#include <fstream>
+#include <mpi.h>
 
 // matrix order wi-1j wij-1 wij wij+1 wij
-
-const int Mx = 39;
-const int Ny = 39;
+const int Mx = 159;
+const int Ny = 159;
 const int size = (Mx + 1) * (Ny + 1);
+
+struct InfoMPI
+{
+    int rank, size;
+    int dims_size[2] = {0, 0};
+    int periods[2] = {0, 0};
+    int coords[2] = {0, 0};
+
+    int x_start, y_start;
+    int x_end, y_end;
+
+    MPI_Comm comm;
+
+    InfoMPI(){
+        MPI_Comm_rank(MPI_COMM_WORLD, &this->rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &this->size);
+        MPI_Dims_create(this->size, 2, this->dims_size);
+        MPI_Cart_create(MPI_COMM_WORLD, 2, this->dims_size, this->periods,
+                        1, &this->comm);
+        MPI_Comm_rank(this->comm, &this->rank);
+        MPI_Cart_coords(this->comm, this->rank, 2, this->coords);
+
+        int block_size_x = Mx / this->dims_size[0];
+        int block_size_y = Ny / this->dims_size[1];
+        this->x_start = this->coords[0] * block_size_x;
+        this->y_start = this->coords[1] * block_size_y;
+
+        this->x_end = this->coords[0] == this->dims_size[0] - 1 ? Mx : (this->coords[0] + 1) * block_size_x;
+        this->y_end = this->coords[1] == this->dims_size[1] - 1 ? Ny : (this->coords[1] + 1) * block_size_y;
+    }
+};
 
 const double f_xy = 1.;
 const double x_start = -1.;
@@ -100,36 +132,32 @@ double monteCarlo(double x0, double x1, double y0, double y1, double (*func)(dou
     return sum / numSamples;
 }
 
-double dot(int n, double *a, double *b) {
+double dot(int n, double *a, double *b, const InfoMPI& info) {
     double sum = 0.0;
     #pragma omp parallel for collapse(2) reduction(+ : sum)
-    for (int i = 1; i < Mx; ++i) {
-        for (int j = 1; j < Ny; ++j) {
+    for (int i = 1 + info.x_start; i < info.x_end; ++i) {
+        for (int j = 1 + info.y_start; j < info.y_end; ++j) {
             sum += a[i * Ny + j] * b[i * Ny + j];
         }
     }
     return dx * dy * sum;
 }
 
-double norm(int n, double *a) {
-    return sqrt(dot(n, a, a));
-}
-
-void add(double *a, double *b, double alpha, double beta, double *result) {
+void add(double *a, double *b, double alpha, double beta, double *result, const InfoMPI& info) {
     #pragma omp parallel for collapse(2)
-    for (int i = 1; i < Mx; ++i) {
-        for (int j = 1; j < Ny; ++j) {
+    for (int i = 1 + info.x_start; i < info.x_end; ++i) {
+        for (int j = 1 + info.y_start; j < info.y_end; ++j) {
             result[i * Ny + j] = alpha * a[i * Ny + j] + beta * b[i * Ny + j];
         }
     }
 }
 
 // matrix order wi-1j wij-1 wij wij+1 wi+1j
-void mul(double *A, double *b, double *result) {
+void mul(double *A, double *b, double *result, const InfoMPI& info) {
     double top_point, bot_point, left_point, right_point;
     #pragma omp parallel for collapse(2) firstprivate(top_point, bot_point, left_point, right_point)
-    for (int i = 1; i < Mx; ++i) {
-        for (int j = 1; j < Ny; ++j) {
+    for (int i = 1 + info.x_start; i < info.x_end; ++i) {
+        for (int j = 1 + info.y_start; j < info.y_end; ++j) {
             top_point = b[(i - 1) * Ny + j];
             bot_point = b[(i + 1) * Ny + j];
             left_point = b[i * Ny + j - 1];
@@ -143,64 +171,87 @@ void mul(double *A, double *b, double *result) {
     }
 }
 
-void copy(double *x, double *y) {
-    #pragma omp parellel for collapse(2)
-    for (int i = 1; i < Mx; ++i)
-        for (int j = 1; j < Ny; ++j) {
+void copy(double *x, double *y, const InfoMPI& info) {
+    #pragma omp parallel for collapse(2)
+    for (int i = 1 + info.x_start; i < info.x_end; ++i)
+        for (int j = 1 + info.y_start; j < info.y_end; ++j) {
             y[i * Ny + j] = x[i * Ny + j];
         }
 }
 
-void optimize(double *matrix, double *f_vector, double *w_vector,
-              double *r_vector, double *Ar_vector) {
-
-    double tau_ar_proc[2] = {0., 0.}, tau_ar[2] = {0., 0.}, tau_k = 0;
-    double eps_proc = 0., eps = 10.;
+void optimize(double *matrix, double *f_vector, double *w_vector, double *r_vector, double *Ar_vector, const InfoMPI& info)
+{
+    double p_vector[(Mx + 1) * (Ny + 1)];
+    double tau_ar_proc[2] = {0., 0.}, tau_ar[2] = {0., 0.};
+    double beta_ar[2] = {0., 0.}, alpha, beta, beta_proc;
+    double eps_proc = 0., eps = 10., f_eps = 10.;
     double wk_vector[(Mx + 1) * (Ny + 1)];
     int iter = 0;
-    while (eps > 1e-07) {
-        copy(w_vector, wk_vector);
 
-        mul(matrix, w_vector, Ar_vector);
+    mul(matrix, w_vector, Ar_vector, info);
+    add(Ar_vector, f_vector, -1., 1., r_vector, info);
+    copy(r_vector, p_vector, info);
 
-        add(Ar_vector, f_vector, 1., -1., r_vector);
+    while (eps > 1e-12)
+    {
+        copy(w_vector, wk_vector, info);
 
-        mul(matrix, r_vector, Ar_vector);
+        tau_ar_proc[0] = dot(size, r_vector, r_vector, info);
 
-        tau_ar[0] = dot(size, Ar_vector, r_vector);
-        tau_ar[1] = dot(size, Ar_vector, Ar_vector);
+        mul(matrix, p_vector, Ar_vector, info);
 
-        tau_k = tau_ar[0] / tau_ar[1];
-        add(w_vector, r_vector, 1.0, -tau_k, w_vector);
+        tau_ar_proc[1] = dot(size, p_vector, Ar_vector, info);
 
-        add(w_vector, wk_vector, 1.0, -1.0, wk_vector);
+        MPI_Allreduce(&tau_ar_proc, &tau_ar, 2, MPI_DOUBLE, MPI_SUM, info.comm);
 
-        //e2 norm
-        eps = norm(size, wk_vector);
+        alpha = tau_ar[0]/tau_ar[1];
 
-        if (iter % 1000 == 0) std::cout << iter<< ": " << std::setprecision(15) << "eps: " << eps << std::endl; // << " (Ar,r): " << tau_ar[0] << " (Ar, Ar): " << tau_ar[1] << std::endl;
+        add(w_vector, p_vector, 1.0, alpha, w_vector, info);
+
+        mul(matrix, w_vector, Ar_vector, info);
+
+        add(Ar_vector, f_vector, -1., 1., r_vector, info);
+
+        beta_proc = dot(size, r_vector, r_vector, info)/tau_ar[0];
+
+        MPI_Allreduce(&beta_proc, &beta, 1, MPI_DOUBLE, MPI_SUM, info.comm);
+
+        add(r_vector, p_vector, 1.0, beta, p_vector, info);
+
+        add(w_vector, wk_vector, 1.0, -1.0, wk_vector, info);
+
+        eps_proc = dot(size, wk_vector, wk_vector, info);
+
+        MPI_Allreduce(&eps_proc, &eps, 1, MPI_DOUBLE, MPI_SUM, info.comm);
+
+        eps = sqrt(eps);
 
         ++iter;
     }
-    std::cout<<"||(Aw - f)|| = "<<norm(size, r_vector)<<std::endl;
-    std::cout << "iter: " << iter << std::endl;
+    eps_proc = dot(size, r_vector, r_vector, info);
+    MPI_Allreduce(&eps_proc, &eps, 1, MPI_DOUBLE, MPI_SUM, info.comm);
+    if (info.rank == 0) {
+        std::cout<<"||(Aw - f)|| = "<<sqrt(eps)<<std::endl;
+        std::cout << "iter: " << iter << std::endl;
+    }
 }
 
-int main() {
-    int countInDomain = 0;
-    int countOuterDomain = 0;
-    double xi, yj;
-    for (int i = 0; i <= Mx; ++i) {
-        xi = x_start + i * dx;
-        for (int j = 0; j <= Ny; ++j) {
-            yj = y_start + j * dy;
-            if (inDomain(xi, yj)) countInDomain += 1;
-            else countOuterDomain += 1;
-        }
-    }
-    std::cout << "in domain: " << countInDomain << std::endl;
-    std::cout << "out domain: " << countOuterDomain << std::endl;
+int main(int argc, char *argv[]) {
+    int rank, size;
+    MPI_Init(&argc, &argv);
 
+    InfoMPI info;
+
+    omp_set_num_threads(2);
+    if (info.rank == 0) {
+        std::cout << "size_x: " << info.dims_size[0] << std::endl;
+        std::cout << "size_y: " << info.dims_size[1] << std::endl;
+    }
+
+//    std::cout<<"rank: "<<info.rank<<std::endl<<"x_start: "<<info.x_start<<std::endl<<"x_end: "<<info.x_end<<std::endl
+//             <<"y_start: "<<info.y_start<<std::endl<<"y_end: "<<info.y_end<<std::endl;
+
+    double xi, yj;
     double xi_2m, yj_2m, xi_2p, yj_2p, aij, ai_pj, bij, bij_p, lij;
     double F_vector[(Mx + 1) * (Ny + 1)];
     double w_vector[(Mx + 1) * (Ny + 1)];
@@ -220,16 +271,12 @@ int main() {
             matrix[i * Ny * 5 + j * 5 + 3] = 0.;
             matrix[i * Ny * 5 + j * 5 + 4] = 0.;
         }
-    std::cout<<"eps: "<<k_eps<<std::endl;
-    std::cout<<"dx: "<<dx<<std::endl;
-    std::cout<<"dy: "<<dy<<std::endl;
-    std::cout.setf(std::ios::fixed);
 
-    double start_time = omp_get_wtime();
+    double start_time = MPI_Wtime();
     // filling
     #pragma omp parallel for collapse(2) firstprivate(xi, yj, xi_2m, xi_2p, yj_2m, yj_2p, aij, ai_pj, bij, bij_p, lij)
-    for (int i = 1; i < Mx; ++i) {
-        for (int j = 1; j < Ny; ++j) {
+    for (int i = 1 + info.x_start; i < info.x_end; ++i) {
+        for (int j = 1 + info.y_start; j < info.y_end; ++j) {
             xi = x_start + i * dx;
             yj = y_start + j * dy;
             // initial solution
@@ -307,23 +354,18 @@ int main() {
         }
     }
 
-    std::cout<<"num threads: "<<omp_get_max_threads()<<std::endl;
+    optimize(matrix, F_vector, w_vector, r_vector, Ar_vector, info);
 
-    optimize(matrix, F_vector, w_vector, r_vector, Ar_vector);
+    double end_time = MPI_Wtime();
+    double result_time, time = end_time - start_time;
 
-    double end_time = omp_get_wtime();
+    MPI_Reduce(&time, &result_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    std::cout<<"time: "<<end_time - start_time<<std::endl;
-//    std::ofstream myfile;
-//    myfile.open ("result");
-//    for (int i = 0; i <= Mx; ++i) {
-//        for (int j = 0; j <= Ny; ++j) {
-//            myfile << w_vector[i * Ny  + j] << " ";
-//        }
-//        myfile << std::endl;
-//    }
-//    myfile.close();
+    if (info.rank == 0) {
+        std::cout<<"result time: "<<result_time<<std::endl;
+    }
 
+    MPI_Finalize();
     return 0;
 }
 
